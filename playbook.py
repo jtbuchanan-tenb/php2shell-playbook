@@ -6,6 +6,7 @@ Tenable Skill's report, builds the fix and hunt lists, and writes a handoff
 file (Markdown and JSON) after each step. Standard library only.
 
     python3 playbook.py find RUN_DIR
+    python3 playbook.py fix RUN_DIR ITEMS_JSON
 """
 import argparse
 import csv
@@ -29,11 +30,13 @@ STATUS_ORDER = [VULN_EOL, VULN_BACKPORT, VULN_PATCH, UNKNOWN, PATCHED, NOT_AFFEC
 # First exploitation attempt seen, per the Tenable Research FAQ.
 HUNT_START = "2026-10-17"
 
+PRIORITIES = ["FIRST", "NEXT", "SOON"]
+
 HOST_FIELDS = ["asset", "ip", "fqdn", "source", "php_version", "status",
                "fixed_version", "last_seen"]
 
 
-class PlaybookError(Exception):
+class PlaybookError(ValueError):
     """Bad input the user can fix; reported as one line."""
 
 
@@ -184,6 +187,82 @@ def find_markdown(h):
     return "\n".join(parts)
 
 
+def load_handoff(run_dir, name, step_cmd):
+    path = Path(run_dir) / f"{name}.json"
+    if not path.is_file():
+        raise PlaybookError(f"{path} not found. Run `playbook.py {step_cmd} {run_dir}` first.")
+    return read_json(path)
+
+
+def build_fix_handoff(find, items):
+    """Match /fix-today's ranked items to the fix list. Items for hosts outside
+    the fix list are reported, not kept; fix-list hosts it didn't rank are listed."""
+    by_key = {(h["asset"], h["ip"]): h for h in find["fix_list"]}
+    by_name = {}
+    for h in find["fix_list"]:
+        by_name.setdefault(h["asset"], []).append(h)
+    kept, out_of_scope, ranked = [], [], set()
+    for item in items:
+        priority = str(item.get("priority", "")).upper()
+        if priority not in PRIORITIES:
+            raise PlaybookError(f"priority must be one of {', '.join(PRIORITIES)}, "
+                                f"got {item.get('priority')!r} for {item.get('asset')!r}")
+        item = dict(item, priority=priority)
+        host = by_key.get((item.get("asset", ""), item.get("ip", "")))
+        if host is None and not item.get("ip"):
+            # A blank IP matches by name only when the name is unambiguous.
+            matches = by_name.get(item.get("asset", ""), [])
+            host = matches[0] if len(matches) == 1 else None
+        if host is None:
+            out_of_scope.append(item)
+            continue
+        item["ip"] = host["ip"]
+        ranked.add((host["asset"], host["ip"]))
+        kept.append(item)
+    kept.sort(key=lambda i: PRIORITIES.index(i["priority"]))  # stable within a priority
+    return {
+        "step": "fix",
+        "version": 1,
+        "created": now_iso(),
+        "run_dir": find["run_dir"],
+        "items": kept,
+        "out_of_scope": out_of_scope,
+        "not_ranked": [h for h in find["fix_list"] if (h["asset"], h["ip"]) not in ranked],
+        "fix_list_size": len(find["fix_list"]),
+    }
+
+
+def fix_markdown(h):
+    run = h["run_dir"]
+    parts = [
+        "# PHP2Shell playbook: step 2 handoff (Fix it)", "",
+        f"Run folder: `{run}`  ",
+        f"Written: {h['created']}", "",
+        f"Ranked {len(h['items'])} of {h['fix_list_size']} hosts on the fix list "
+        "with /fix-today (Remediation Priority & Impact Agent).", "",
+    ]
+    for p in PRIORITIES:
+        group = [i for i in h["items"] if i["priority"] == p]
+        parts += [f"## {p} ({len(group)})", ""]
+        if not group:
+            parts += ["None.", ""]
+        for i in group:
+            parts += [f"### {i.get('asset')} ({i.get('ip') or 'no IP'})", "",
+                      f"- **Fix:** {i.get('fix') or '–'}",
+                      f"- **Interim mitigation:** {i.get('mitigation') or '–'}",
+                      f"- **Why:** {i.get('why') or '–'}", ""]
+    parts += ["## Out of scope (dropped)", "",
+              "Items /fix-today ranked that are not on the PHP2Shell fix list. "
+              "They are not part of this response.", ""]
+    parts += ([f"- {i.get('priority')}: {i.get('asset')} ({i.get('ip') or 'no IP'}): "
+               f"{i.get('fix') or '–'}" for i in h["out_of_scope"]] or ["None."])
+    parts += ["", "## Not ranked by /fix-today", "",
+              "Hosts on the fix list that /fix-today did not rank. They still need a fix.", ""]
+    parts += [host_table(h["not_ranked"]) if h["not_ranked"] else "None."]
+    parts += ["", "## Next step", "", f"`/php2shell-playbook hunt {run}`", ""]
+    return "\n".join(parts)
+
+
 def write_handoff(run_dir, name, data, markdown):
     run_dir = Path(run_dir)
     jpath, mpath = run_dir / f"{name}.json", run_dir / f"{name}.md"
@@ -199,12 +278,28 @@ def cmd_find(args):
     print(f"fix_list={len(h['fix_list'])} hunt_list={len(h['hunt_list'])}")
 
 
+def cmd_fix(args):
+    find = load_handoff(args.run_dir, "handoff-1-find", "find")
+    items = read_json(args.items_json)
+    if not isinstance(items, list):
+        raise PlaybookError(f"{args.items_json} must hold a JSON list of items")
+    h = build_fix_handoff(find, items)
+    for p in write_handoff(args.run_dir, "handoff-2-fix", h, fix_markdown(h)):
+        print(p)
+    print(f"ranked={len(h['items'])} out_of_scope={len(h['out_of_scope'])} "
+          f"not_ranked={len(h['not_ranked'])}")
+
+
 def parser():
     p = argparse.ArgumentParser(prog="playbook.py", description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="command", required=True)
     s = sub.add_parser("find", help="write handoff 1 from the step 1 run folder")
     s.add_argument("run_dir")
     s.set_defaults(func=cmd_find)
+    s = sub.add_parser("fix", help="write handoff 2 from /fix-today's ranked items")
+    s.add_argument("run_dir")
+    s.add_argument("items_json")
+    s.set_defaults(func=cmd_fix)
     return p
 
 

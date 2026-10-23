@@ -110,5 +110,59 @@ class FindHandoffTest(RunDirTest):
         self.assertNotEqual(run_cli(["find", str(self.run)])[0], 0)
 
 
+ITEMS = FIXTURES / "fix-items.json"
+
+
+class FixHandoffTest(RunDirTest):
+    def setUp(self):
+        super().setUp()
+        self.find = playbook.build_find_handoff(self.run)
+        self.items = json.loads(ITEMS.read_text(encoding="utf-8"))
+
+    def test_items_sorted_by_priority(self):
+        h = playbook.build_fix_handoff(self.find, self.items)
+        self.assertEqual([i["priority"] for i in h["items"]], ["FIRST", "SOON"])
+        self.assertEqual(h["fix_list_size"], 4)
+
+    def test_out_of_scope_items_are_reported_not_kept(self):
+        h = playbook.build_fix_handoff(self.find, self.items)
+        self.assertEqual([i["asset"] for i in h["out_of_scope"]], ["dbserver9"])
+
+    def test_unranked_fix_hosts_are_listed(self):
+        h = playbook.build_fix_handoff(self.find, self.items)
+        self.assertEqual({x["asset"] for x in h["not_ranked"]}, {"mystery01", "future01"})
+
+    def test_bad_priority_is_rejected(self):
+        with self.assertRaises(ValueError):
+            playbook.build_fix_handoff(
+                self.find, [{"priority": "LATER", "asset": "old01", "ip": "10.0.0.3"}])
+
+    def test_blank_ip_matches_unique_asset_only(self):
+        self.find["fix_list"].append({"asset": "old01", "ip": "10.0.0.33", "status": "Vulnerable – EOL"})
+        h = playbook.build_fix_handoff(self.find, [
+            {"priority": "FIRST", "asset": "mystery01", "ip": "", "fix": "x"},
+            {"priority": "NEXT", "asset": "old01", "ip": "", "fix": "y"},
+        ])
+        self.assertEqual([i["asset"] for i in h["items"]], ["mystery01"])
+        self.assertEqual(h["items"][0]["ip"], "10.0.0.4")
+        self.assertEqual([i["asset"] for i in h["out_of_scope"]], ["old01"])
+
+    def test_markdown_has_sections_and_next_step(self):
+        md = playbook.fix_markdown(playbook.build_fix_handoff(self.find, self.items))
+        for s in ["FIRST", "NEXT", "SOON", "Out of scope", "Not ranked",
+                  "Upgrade to a supported PHP branch", "/php2shell-playbook hunt"]:
+            self.assertIn(s, md)
+
+    def test_cli_fix_requires_handoff_1(self):
+        self.assertNotEqual(run_cli(["fix", str(self.run), str(ITEMS)])[0], 0)
+
+    def test_cli_fix_writes_handoff_2(self):
+        run_cli(["find", str(self.run)])
+        self.assertEqual(run_cli(["fix", str(self.run), str(ITEMS)])[0], 0)
+        data = json.loads((self.run / "handoff-2-fix.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["step"], "fix")
+        self.assertTrue((self.run / "handoff-2-fix.md").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
