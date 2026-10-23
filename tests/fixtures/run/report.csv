@@ -1,0 +1,8 @@
+﻿asset,ip,fqdn,source,plugin_id,plugin_name,php_version,port,last_seen,status,fixed_version
+web01,10.0.0.1,web01.example.com,VM,369483,PHP < 8.2.35 Multiple Vulnerabilities,8.3.10,443,2026-10-20,Patched,8.3.36
+web01,10.0.0.1,web01.example.com,VM,48243,PHP Version Detection,8.3.10,443,2026-10-22,Vulnerable – patch available,8.3.36
+web01,10.0.0.2,,VM,48243,PHP Version Detection,8.4.27,80,2026-10-21,Patched,8.4.27
+old01,10.0.0.3,,VM,58987,PHP Unsupported Version Detection,7.2.1,80,2026-10-19,Vulnerable – EOL,
+mystery01,10.0.0.4,,WAS,115720,PHP 8.4.x Multiple Vulnerabilities,,443,2026-10-22,Unknown – verify,
+future01,10.0.0.5,,Cloud,476454,Alpine PHP package update,8.5.1,,2026-10-22,Vulnerable – something new,8.5.12
+ancient01,10.0.0.6,,VM,48243,PHP Version Detection,5.3.3,80,2026-10-18,Not affected,
