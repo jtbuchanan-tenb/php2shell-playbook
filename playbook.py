@@ -7,11 +7,15 @@ file (Markdown and JSON) after each step. Standard library only.
 
     python3 playbook.py find RUN_DIR
     python3 playbook.py fix RUN_DIR ITEMS_JSON
+    python3 playbook.py hypothesis RUN_DIR
+    python3 playbook.py hunt-kit RUN_DIR
+    python3 playbook.py hunt RUN_DIR RESULT_JSON
 """
 import argparse
 import csv
 import json
 import sys
+from string import Template
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -31,6 +35,13 @@ STATUS_ORDER = [VULN_EOL, VULN_BACKPORT, VULN_PATCH, UNKNOWN, PATCHED, NOT_AFFEC
 HUNT_START = "2026-10-17"
 
 PRIORITIES = ["FIRST", "NEXT", "SOON"]
+
+# Above this many hosts, the hunt kit points at hunt-hosts.csv instead of
+# writing every hostname into the queries.
+INLINE_HOST_LIMIT = 200
+KIT_DIR = Path(__file__).resolve().parent / "hunt-kit"
+KIT_FILES = ["splunk.md", "defender-sentinel.md", "elastic.md", "checklist.md"]
+DEFAULT_CVES = ["CVE-2026-109618", "CVE-2026-109619"]
 
 HOST_FIELDS = ["asset", "ip", "fqdn", "source", "php_version", "status",
                "fixed_version", "last_seen"]
@@ -263,6 +274,174 @@ def fix_markdown(h):
     return "\n".join(parts)
 
 
+def host_names(hosts):
+    return sorted({h.get("fqdn") or h.get("asset") for h in hosts
+                   if h.get("fqdn") or h.get("asset")})
+
+
+def quote_list(names, lang):
+    """Double-quoted, comma-separated string literals. SPL, KQL and ES|QL all
+    escape a backslash and a double quote with a backslash."""
+    if lang not in ("spl", "kql", "esql"):
+        raise PlaybookError(f"unknown query language {lang!r}")
+    return ", ".join('"' + n.replace("\\", "\\\\").replace('"', '\\"') + '"' for n in names)
+
+
+def hunt_scope(find):
+    """'inline' (hosts written into queries), 'lookup' (too many: use
+    hunt-hosts.csv) or 'fleet' (no hosts known: hunt everything)."""
+    n = len(find["hunt_list"])
+    if n == 0:
+        return "fleet"
+    return "inline" if n <= INLINE_HOST_LIMIT else "lookup"
+
+
+def hunt_hosts_path(find):
+    return Path(find["run_dir"]) / "hunt-hosts.csv"
+
+
+def write_hunt_hosts(find):
+    path = hunt_hosts_path(find)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["host", "ip"])
+        for h in find["hunt_list"]:
+            w.writerow([h.get("fqdn") or h.get("asset") or "", h.get("ip") or ""])
+    return path
+
+
+def cves(find):
+    return (find.get("faq") or {}).get("cves") or DEFAULT_CVES
+
+
+def hunt_hypothesis(find):
+    scope = hunt_scope(find)
+    if scope == "inline":
+        where = "on these hosts: " + ", ".join(host_names(find["hunt_list"]))
+    elif scope == "lookup":
+        where = (f"fleet-wide: all PHP web servers. The {len(find['hunt_list'])} hosts "
+                 f"Tenable saw running PHP are listed in {hunt_hosts_path(find)}; start with those")
+    else:
+        where = "fleet-wide: all PHP web servers (Tenable reported no PHP hosts)"
+    return (f"Hunt for PHP2Shell ({', '.join(cves(find))}) exploitation since {HUNT_START} "
+            f"{where}. No IOCs are published, so hunt on behavior: PHP worker processes "
+            "(php-fpm, php-cgi, httpd, apache2) spawning a shell, curl or wget; new .php files "
+            "written under web roots; outbound connections initiated by PHP workers. Hosts that "
+            "have since patched are in scope, because the question is whether they were hit "
+            "before patching.")
+
+
+def kit_values(find):
+    scope = hunt_scope(find)
+    names = host_names(find["hunt_list"])
+    y, m, d = HUNT_START.split("-")
+    values = {"start": HUNT_START, "start_spl": f"{m}/{d}/{y}:00:00:00", "start_us": f"{m}/{d}/{y}"}
+    spl_fields = {"proc_filter": "Processes.dest", "file_filter": "Filesystem.dest", "net_filter": "host"}
+    for key, field in spl_fields.items():
+        if scope == "inline":
+            values[key] = f"{field} IN ({quote_list(names, 'spl')})"
+        elif scope == "lookup":
+            values[key] = f"[| inputlookup hunt-hosts.csv | rename host AS {field} | fields {field}]"
+        else:
+            values[key] = ""
+    if scope == "inline":
+        values["kql_filter"] = f"| where DeviceName in~ ({quote_list(names, 'kql')})"
+        values["esql_filter"] = f"AND host.name IN ({quote_list(names, 'esql')})"
+    elif scope == "lookup":
+        values["kql_filter"] = '| where DeviceName in~ ((_GetWatchlist("php2shell-hunt-hosts") | project SearchKey))'
+        values["esql_filter"] = ""
+    else:
+        values["kql_filter"] = values["esql_filter"] = ""
+    return values
+
+
+def render_hunt_kit(find, kit_dir=KIT_DIR):
+    scope = hunt_scope(find)
+    n = len(find["hunt_list"])
+    if scope == "inline":
+        scope_text = (f"The searches are limited to the {n} hosts Tenable saw running PHP "
+                      "(patched or not); the same hosts are in `hunt-hosts.csv`.")
+    elif scope == "lookup":
+        scope_text = (
+            f"Tenable saw {n} hosts running PHP, too many to write into each search. "
+            "The host list is in `hunt-hosts.csv` (columns `host`, `ip`):\n\n"
+            "- **Splunk:** upload it as a lookup file named `hunt-hosts.csv`.\n"
+            "- **Sentinel:** create a watchlist named `php2shell-hunt-hosts` from it with "
+            "`host` as the search key. Defender XDR advanced hunting has no watchlists; "
+            "run the searches fleet-wide there.\n"
+            "- **Elastic:** the searches run fleet-wide; check hits against the file.")
+    else:
+        scope_text = ("Tenable reported no PHP hosts, so every search runs fleet-wide. "
+                      "That also catches PHP servers Tenable never scanned.")
+    parts = [
+        "# PHP2Shell hunt kit", "",
+        f"Hunt for PHP2Shell ({', '.join(cves(find))}) exploitation since {HUNT_START}. "
+        "Behavior-based: no PHP2Shell IOCs have been published, so these searches look for "
+        "what exploitation does, not for known indicators.", "",
+        "## Scope", "", scope_text, "",
+        "Every search can also be run fleet-wide by removing its host filter, which catches "
+        "PHP servers Tenable never scanned.", "",
+        "Contents: Splunk, Microsoft Defender XDR and Sentinel (KQL), Elastic (ES|QL), "
+        "and a manual checklist for one Linux host.", "",
+    ]
+    values = kit_values(find)
+    for name in KIT_FILES:
+        text = (Path(kit_dir) / name).read_text(encoding="utf-8")
+        parts += [Template(text).substitute(values).rstrip(), ""]
+    return "\n".join(parts)
+
+
+def build_hunt_handoff(run_dir, result):
+    find = load_handoff(run_dir, "handoff-1-find", "find")
+    mode = result.get("mode")
+    if mode not in ("soc-hunter", "hunt-kit"):
+        raise PlaybookError(f"mode must be 'soc-hunter' or 'hunt-kit', got {mode!r}")
+    kit = None
+    if mode == "hunt-kit":
+        kit_path = Path(run_dir) / "hunt-kit.md"
+        if not kit_path.is_file():
+            raise PlaybookError(f"{kit_path} not found. Run `playbook.py hunt-kit {run_dir}` first.")
+        kit = str(kit_path)
+    h = {
+        "step": "hunt",
+        "version": 1,
+        "created": now_iso(),
+        "run_dir": str(run_dir),
+        "start_date": HUNT_START,
+        "hunt_list_size": len(find["hunt_list"]),
+    }
+    h.update(result)
+    h["kit"] = kit
+    if mode == "soc-hunter":
+        h.setdefault("hunt_file", None)
+        h.setdefault("verdict", None)
+        h.setdefault("findings", [])
+    return h
+
+
+def hunt_markdown(h):
+    parts = [
+        "# PHP2Shell playbook: step 3 handoff (Hunt for it)", "",
+        f"Run folder: `{h['run_dir']}`  ",
+        f"Written: {h['created']}", "",
+        f"Hunt window: since {h['start_date']}. Hosts in scope: {h['hunt_list_size']} "
+        "(every host Tenable saw running PHP, patched or not).", "",
+    ]
+    if h["mode"] == "soc-hunter":
+        parts += ["## SOC-Hunter result", "",
+                  f"- **Hunt file:** `{h.get('hunt_file') or 'not recorded'}`",
+                  f"- **Verdict:** {h.get('verdict') or 'not recorded'}", "",
+                  "### Findings", ""]
+        parts += [f"- {f}" for f in h.get("findings") or []] or ["None reported."]
+    else:
+        parts += ["## Hunt kit", "",
+                  "SOC-Hunter was not run. The hunt kit has ready-to-paste searches for "
+                  f"Splunk, Defender XDR / Sentinel and Elastic, plus a manual checklist: `{h['kit']}`"]
+    parts += ["", "## Next step", "",
+              f"`python3 playbook.py summary {h['run_dir']}` writes the summary of all three steps.", ""]
+    return "\n".join(parts)
+
+
 def write_handoff(run_dir, name, data, markdown):
     run_dir = Path(run_dir)
     jpath, mpath = run_dir / f"{name}.json", run_dir / f"{name}.md"
@@ -290,6 +469,30 @@ def cmd_fix(args):
           f"not_ranked={len(h['not_ranked'])}")
 
 
+def cmd_hypothesis(args):
+    find = load_handoff(args.run_dir, "handoff-1-find", "find")
+    write_hunt_hosts(find)
+    print(hunt_hypothesis(find))
+
+
+def cmd_hunt_kit(args):
+    find = load_handoff(args.run_dir, "handoff-1-find", "find")
+    hosts = write_hunt_hosts(find)
+    kit = Path(args.run_dir) / "hunt-kit.md"
+    kit.write_text(render_hunt_kit(find), encoding="utf-8")
+    print(kit)
+    print(hosts)
+
+
+def cmd_hunt(args):
+    result = read_json(args.result_json)
+    if not isinstance(result, dict):
+        raise PlaybookError(f"{args.result_json} must hold a JSON object")
+    h = build_hunt_handoff(args.run_dir, result)
+    for p in write_handoff(args.run_dir, "handoff-3-hunt", h, hunt_markdown(h)):
+        print(p)
+
+
 def parser():
     p = argparse.ArgumentParser(prog="playbook.py", description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="command", required=True)
@@ -300,6 +503,16 @@ def parser():
     s.add_argument("run_dir")
     s.add_argument("items_json")
     s.set_defaults(func=cmd_fix)
+    s = sub.add_parser("hypothesis", help="print the SOC-Hunter hunt hypothesis")
+    s.add_argument("run_dir")
+    s.set_defaults(func=cmd_hypothesis)
+    s = sub.add_parser("hunt-kit", help="write hunt-kit.md and hunt-hosts.csv")
+    s.add_argument("run_dir")
+    s.set_defaults(func=cmd_hunt_kit)
+    s = sub.add_parser("hunt", help="write handoff 3 from the hunt result")
+    s.add_argument("run_dir")
+    s.add_argument("result_json")
+    s.set_defaults(func=cmd_hunt)
     return p
 
 

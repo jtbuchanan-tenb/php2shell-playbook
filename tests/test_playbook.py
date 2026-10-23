@@ -164,5 +164,114 @@ class FixHandoffTest(RunDirTest):
         self.assertTrue((self.run / "handoff-2-fix.md").exists())
 
 
+KIT_DIR = ROOT / "hunt-kit"
+PLACEHOLDERS = r"\$\{?(start|start_spl|start_us|proc_filter|file_filter|net_filter|kql_filter|esql_filter)\b"
+
+
+def many_hosts(n):
+    return [{"asset": f"h{i}", "fqdn": "", "ip": f"10.1.{i // 250}.{i % 250}",
+             "status": "Patched"} for i in range(n)]
+
+
+class HuntTest(RunDirTest):
+    def setUp(self):
+        super().setUp()
+        run_cli(["find", str(self.run)])
+        self.find = playbook.load_handoff(self.run, "handoff-1-find", "find")
+
+    def test_hypothesis_names_hosts_date_and_behaviors(self):
+        t = playbook.hunt_hypothesis(self.find)
+        for s in ["2026-10-17", "web01.example.com", "ancient01", "php-fpm", "shell",
+                  ".php", "outbound", "CVE-2026-109618", "patched"]:
+            self.assertIn(s, t)
+
+    def test_host_names_prefer_fqdn_and_dedupe(self):
+        names = playbook.host_names(self.find["hunt_list"])
+        self.assertIn("web01.example.com", names)
+        self.assertEqual(names.count("web01"), 1)   # 10.0.0.2 has no fqdn
+        self.assertEqual(names, sorted(names))
+
+    def test_hunt_kit_has_every_platform_and_no_unfilled_placeholders(self):
+        md = playbook.render_hunt_kit(self.find, KIT_DIR)
+        for s in ["Splunk", "Sentinel", "Elastic", "checklist", "2026-10-17",
+                  "10/17/2026:00:00:00", "web01.example.com", "fleet-wide"]:
+            self.assertIn(s, md)
+        self.assertNotRegex(md, PLACEHOLDERS)
+        self.assertIn('Processes.dest IN ("ancient01"', md)
+        self.assertIn('| where DeviceName in~ ("ancient01"', md)
+        self.assertIn('AND host.name IN ("ancient01"', md)
+        self.assertIn('matches regex @"^php[0-9.]*$"', md)   # $$ in the template renders as $
+
+    def test_hostnames_are_escaped_per_language(self):
+        self.assertEqual(playbook.quote_list(['a"b', 'c\\d'], "spl"), '"a\\"b", "c\\\\d"')
+        self.assertEqual(playbook.quote_list(['a"b'], "kql"), '"a\\"b"')
+        self.assertEqual(playbook.quote_list(['a"b'], "esql"), '"a\\"b"')
+
+    def test_large_hunt_list_uses_lookup_file(self):
+        self.find["hunt_list"] = many_hosts(201)
+        md = playbook.render_hunt_kit(self.find, KIT_DIR)
+        self.assertIn("hunt-hosts.csv", md)
+        self.assertIn("inputlookup hunt-hosts.csv", md)
+        self.assertIn("_GetWatchlist", md)
+        self.assertNotIn("h200", md)
+        self.assertNotRegex(md, PLACEHOLDERS)
+        self.assertIn("hunt-hosts.csv", playbook.hunt_hypothesis(self.find))
+        self.assertNotIn("h200", playbook.hunt_hypothesis(self.find))
+
+    def test_inline_limit_is_200(self):
+        self.find["hunt_list"] = many_hosts(200)
+        self.assertIn("h199", playbook.render_hunt_kit(self.find, KIT_DIR))
+
+    def test_hunt_kit_with_no_hosts_is_fleet_wide(self):
+        self.find["hunt_list"] = []
+        md = playbook.render_hunt_kit(self.find, KIT_DIR)
+        self.assertIn("fleet-wide", md)
+        self.assertNotIn("Processes.dest IN", md)
+        self.assertNotRegex(md, PLACEHOLDERS)
+        self.assertIn("fleet-wide", playbook.hunt_hypothesis(self.find))
+
+    def test_cli_hunt_kit_writes_kit_and_hosts_csv(self):
+        self.assertEqual(run_cli(["hunt-kit", str(self.run)])[0], 0)
+        self.assertTrue((self.run / "hunt-kit.md").exists())
+        with open(self.run / "hunt-hosts.csv", newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+        self.assertEqual(rows[0], ["host", "ip"])
+        self.assertEqual(len(rows), 7)
+
+    def test_cli_hypothesis_prints_text(self):
+        code, out, _ = run_cli(["hypothesis", str(self.run)])
+        self.assertEqual(code, 0)
+        self.assertIn("2026-10-17", out)
+
+    def test_hunt_handoff_soc_hunter_mode(self):
+        h = playbook.build_hunt_handoff(self.run, {
+            "mode": "soc-hunter", "hunt_file": "hunts/H-0001.md",
+            "verdict": "no evidence of exploitation", "findings": []})
+        self.assertEqual(h["start_date"], "2026-10-17")
+        self.assertEqual(h["hunt_list_size"], 6)
+        self.assertIsNone(h["kit"])
+        self.assertIn("H-0001", playbook.hunt_markdown(h))
+
+    def test_hunt_handoff_kit_mode_needs_the_kit(self):
+        with self.assertRaises(ValueError):
+            playbook.build_hunt_handoff(self.run, {"mode": "hunt-kit"})
+        run_cli(["hunt-kit", str(self.run)])
+        h = playbook.build_hunt_handoff(self.run, {"mode": "hunt-kit"})
+        self.assertTrue(h["kit"].endswith("hunt-kit.md"))
+
+    def test_hunt_handoff_rejects_unknown_mode(self):
+        with self.assertRaises(ValueError):
+            playbook.build_hunt_handoff(self.run, {"mode": "vibes"})
+
+    def test_cli_hunt_writes_handoff_3(self):
+        result = self.run / "hunt-result.json"
+        result.write_text(json.dumps({"mode": "soc-hunter", "hunt_file": "hunts/H-0002.md",
+                                      "verdict": "1 suspicious", "findings": ["web01: bash under php-fpm"]}))
+        self.assertEqual(run_cli(["hunt", str(self.run), str(result)])[0], 0)
+        data = json.loads((self.run / "handoff-3-hunt.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["step"], "hunt")
+        self.assertTrue((self.run / "handoff-3-hunt.md").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
