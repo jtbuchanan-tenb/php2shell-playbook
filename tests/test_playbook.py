@@ -2,6 +2,7 @@ import contextlib
 import csv
 import io
 import json
+import re
 import shutil
 import sys
 import tempfile
@@ -361,6 +362,37 @@ class SummaryTest(RunDirTest):
 
     def test_summary_without_handoff_1_fails(self):
         self.assertNotEqual(run_cli(["summary", str(self.run)])[0], 0)
+
+
+VETTING_DISCLAIMER = (
+    "Exchange Inspector vetting covers the reviewed commit, not later changes. "
+    "Remediation Priority & Impact Agent was vetted on Sep 23, 2026 at `536616f` and "
+    "SOC-Hunter on Oct 7, 2026 at `5eea59b`; this installs the latest version.")
+HEXA_DOCS = ("https://docs.tenable.com/vulnerability-management/Content/"
+             "getting-started/hexa-AI-MCP.htm")
+
+
+class SkillMdTest(unittest.TestCase):
+    def setUp(self):
+        self.text = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+
+    def test_frontmatter(self):
+        m = re.match(r"---\n(.*?)\n---\n", self.text, re.S)
+        self.assertIsNotNone(m)
+        self.assertIn("name: php2shell-playbook", m.group(1))
+        desc = re.search(r"^description: (.+)$", m.group(1), re.M)
+        self.assertIsNotNone(desc)
+        self.assertIn("PHP2Shell", desc.group(1))
+
+    def test_cli_commands_match_playbook_py(self):
+        defined = set(playbook.parser()._subparsers._group_actions[0].choices)
+        used = set(re.findall(r"playbook\.py ([a-z][a-z-]*)", self.text))
+        self.assertEqual(used, defined)
+
+    def test_required_text(self):
+        for s in [HEXA_DOCS, playbook.FAQ_URL, VETTING_DISCLAIMER, "2026-10-17",
+                  "separate terminal", "fatal_error_backtraces=0"]:
+            self.assertIn(s, self.text)
 
 
 if __name__ == "__main__":
