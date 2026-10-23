@@ -1,5 +1,37 @@
 [
-  {"priority": "SOON", "asset": "web01", "ip": "10.0.0.1", "fix": "Upgrade PHP to 8.3.36 or later.", "mitigation": "Set memory_limit=-1 and session.upload_progress.enabled=0, then restart PHP-FPM.", "why": "Internal host, low AES."},
-  {"priority": "FIRST", "asset": "old01", "ip": "10.0.0.3", "fix": "Upgrade to a supported PHP branch (8.2.35 or later).", "mitigation": "Set memory_limit=-1 and session.upload_progress.enabled=0, then restart Apache.", "why": "Internet-facing, end-of-life PHP, highest AES."},
-  {"priority": "NEXT", "asset": "dbserver9", "ip": "10.0.0.99", "fix": "Apply KB5031234.", "mitigation": "", "why": "Critical exploitable finding."}
+  {
+    "priority": "SOON",
+    "asset": "web01",
+    "ip": "10.0.0.1",
+    "fix": "Upgrade PHP to 8.3.36 or later.",
+    "mitigation": "Set memory_limit=-1 and session.upload_progress.enabled=0, then restart PHP-FPM.",
+    "why": "Internal host, low AES.",
+    "cves": [
+      "CVE-2026-109618",
+      "CVE-2026-109619"
+    ]
+  },
+  {
+    "priority": "FIRST",
+    "asset": "old01",
+    "ip": "10.0.0.3",
+    "fix": "Upgrade to a supported PHP branch (8.2.35 or later).",
+    "mitigation": "Set memory_limit=-1 and session.upload_progress.enabled=0, then restart Apache.",
+    "why": "Internet-facing, end-of-life PHP, highest AES.",
+    "cves": [
+      "CVE-2026-109618",
+      "CVE-2026-109619"
+    ]
+  },
+  {
+    "priority": "NEXT",
+    "asset": "dbserver9",
+    "ip": "10.0.0.99",
+    "fix": "Apply KB5031234.",
+    "mitigation": "",
+    "why": "Critical exploitable finding.",
+    "cves": [
+      "CVE-2025-1234"
+    ]
+  }
 ]

@@ -83,6 +83,12 @@ class FindHandoffTest(RunDirTest):
         self.assertEqual(h["fix_list"], [])
         self.assertEqual(len(h["hunt_list"]), 2)
 
+    def test_markdown_lists_the_hunt_list(self):
+        md = playbook.find_markdown(playbook.build_find_handoff(self.run))
+        hunt = md.split("## Hunt list")[1].split("## Step 1 reports")[0]
+        self.assertIn("ancient01", hunt)
+        self.assertIn("Patched", hunt)
+
     def test_faq_values_carried_from_faq_json(self):
         h = playbook.build_find_handoff(self.run)
         self.assertEqual(h["faq"]["cves"], ["CVE-2026-109618", "CVE-2026-109619"])
@@ -136,17 +142,40 @@ class FixHandoffTest(RunDirTest):
     def test_bad_priority_is_rejected(self):
         with self.assertRaises(ValueError):
             playbook.build_fix_handoff(
-                self.find, [{"priority": "LATER", "asset": "old01", "ip": "10.0.0.3"}])
+                self.find, [{"priority": "LATER", "asset": "old01", "ip": "10.0.0.3",
+                             "cves": ["CVE-2026-109618"]}])
 
     def test_blank_ip_matches_unique_asset_only(self):
         self.find["fix_list"].append({"asset": "old01", "ip": "10.0.0.33", "status": "Vulnerable – EOL"})
         h = playbook.build_fix_handoff(self.find, [
-            {"priority": "FIRST", "asset": "mystery01", "ip": "", "fix": "x"},
-            {"priority": "NEXT", "asset": "old01", "ip": "", "fix": "y"},
+            {"priority": "FIRST", "asset": "mystery01", "ip": "", "fix": "x", "cves": ["CVE-2026-109618"]},
+            {"priority": "NEXT", "asset": "old01", "ip": "", "fix": "y", "cves": ["CVE-2026-109618"]},
         ])
         self.assertEqual([i["asset"] for i in h["items"]], ["mystery01"])
         self.assertEqual(h["items"][0]["ip"], "10.0.0.4")
         self.assertEqual([i["asset"] for i in h["out_of_scope"]], ["old01"])
+
+    def test_non_php2shell_items_are_out_of_scope(self):
+        h = playbook.build_fix_handoff(self.find, [
+            {"priority": "FIRST", "asset": "web01", "ip": "10.0.0.1",
+             "fix": "Apply KB5046612", "cves": ["CVE-2025-1234"]}])
+        self.assertEqual(h["items"], [])
+        self.assertEqual(h["out_of_scope"][0]["fix"], "Apply KB5046612")
+
+    def test_items_without_cves_are_rejected(self):
+        with self.assertRaises(ValueError):
+            playbook.build_fix_handoff(self.find, [
+                {"priority": "FIRST", "asset": "old01", "ip": "10.0.0.3", "fix": "x"}])
+
+    def test_matching_ignores_case_and_uses_fqdn_or_ip(self):
+        h = playbook.build_fix_handoff(self.find, [
+            {"priority": "FIRST", "asset": "WEB01.EXAMPLE.COM", "ip": "", "fix": "a",
+             "cves": ["CVE-2026-109618"]},
+            {"priority": "NEXT", "asset": "old01.corp.example", "ip": "10.0.0.3", "fix": "b",
+             "cves": ["CVE-2026-109619"]}])
+        self.assertEqual([(i["asset"], i["ip"]) for i in h["items"]],
+                         [("WEB01.EXAMPLE.COM", "10.0.0.1"), ("old01.corp.example", "10.0.0.3")])
+        self.assertEqual(h["out_of_scope"], [])
 
     def test_markdown_has_sections_and_next_step(self):
         md = playbook.fix_markdown(playbook.build_fix_handoff(self.find, self.items))
@@ -201,7 +230,46 @@ class HuntTest(RunDirTest):
         self.assertIn('Processes.dest IN ("ancient01"', md)
         self.assertIn('| where DeviceName in~ ("ancient01"', md)
         self.assertIn('AND host.name IN ("ancient01"', md)
-        self.assertIn('matches regex @"^php[0-9.]*$"', md)   # $$ in the template renders as $
+        self.assertIn('InitiatingProcessFileName startswith "php"', md)
+        self.assertNotIn('has_any ("php-fpm"', md)    # misses Debian's php-fpm8.2
+
+    def test_moved_run_folder_uses_the_new_folder(self):
+        moved = Path(self._tmp.name) / "copied-from-share"
+        shutil.copytree(self.run, moved)
+        shutil.rmtree(self.run)
+        code, _, err = run_cli(["hunt-kit", str(moved)])
+        self.assertEqual((code, err), (0, ""))
+        self.assertTrue((moved / "hunt-hosts.csv").exists())
+        find = playbook.load_handoff(moved, "handoff-1-find", "find")
+        self.assertEqual(find["run_dir"], str(moved))
+        self.find["hunt_list"] = many_hosts(201)
+        self.find["run_dir"] = str(moved)
+        self.assertIn(str(moved), playbook.hunt_hypothesis(self.find))
+
+    def test_host_names_include_short_name_and_asset(self):
+        names = playbook.host_names([{"asset": "WEB01", "fqdn": "web01.example.com", "ip": "10.0.0.1"}])
+        self.assertEqual(names, ["WEB01", "web01", "web01.example.com"])
+
+    def test_ip_only_hosts_stay_in_scope(self):
+        self.find["hunt_list"] = [{"asset": "", "fqdn": "", "ip": "10.7.0.1", "status": "Patched"}]
+        md = playbook.render_hunt_kit(self.find, KIT_DIR)
+        self.assertIn('Processes.dest IN ("10.7.0.1")', md)
+        self.assertNotIn("IN ()", md)
+        self.assertNotRegex(md, PLACEHOLDERS)
+        self.assertIn("10.7.0.1", playbook.hunt_hypothesis(self.find))
+
+    def test_kit_warns_about_name_formats_and_time_pickers(self):
+        md = playbook.render_hunt_kit(self.find, KIT_DIR)
+        self.assertIn("short names", md.split("## Splunk")[0])
+        self.assertIn("time picker", md.split("## Microsoft Defender")[1].split("## Elastic")[0])
+        self.assertIn("time picker", md.split("## Elastic")[1])
+        self.assertIn('index=* sourcetype="sysmon:linux"', md)
+
+    def test_fleet_kql_has_no_blank_lines_inside_queries(self):
+        self.find["hunt_list"] = []
+        md = playbook.render_hunt_kit(self.find, KIT_DIR)
+        for block in re.findall(r"```kql\n(.*?)```", md, re.S):
+            self.assertNotIn("\n\n", block)
 
     def test_hostnames_are_escaped_per_language(self):
         self.assertEqual(playbook.quote_list(['a"b', 'c\\d'], "spl"), '"a\\"b", "c\\\\d"')
@@ -391,7 +459,8 @@ class SkillMdTest(unittest.TestCase):
 
     def test_required_text(self):
         for s in [HEXA_DOCS, playbook.FAQ_URL, VETTING_DISCLAIMER, "2026-10-17",
-                  "separate terminal", "fatal_error_backtraces=0"]:
+                  "separate terminal", "fatal_error_backtraces=0", "revoke", "cves",
+                  "only the PHP2Shell part"]:
             self.assertIn(s, self.text)
 
 

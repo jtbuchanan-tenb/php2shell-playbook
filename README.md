@@ -38,7 +38,7 @@ Source: the [Tenable Research PHP2Shell FAQ](https://www.tenable.com/blog/php2sh
    - The **hunt list:** every host running PHP, patched or not. A host that patched after Oct 17 may have been hit before it did.
 
    Then it asks whether to continue.
-3. **Fix it.** Runs `/fix-today` scoped to the fix list and the PHP2Shell CVEs. It writes `handoff-2-fix.md` and `.json`: a FIRST / NEXT / SOON plan with Tenable's fix for each host. Anything `/fix-today` ranked outside the fix list is listed as out of scope, not mixed in. Then it asks whether to continue.
+3. **Fix it.** Runs `/fix-today` scoped to the fix list and the PHP2Shell CVEs. It writes `handoff-2-fix.md` and `.json`: a FIRST / NEXT / SOON plan with Tenable's fix for each host. Anything `/fix-today` ranked for another host, or for CVEs other than PHP2Shell's, is listed as out of scope, not mixed in. Then it asks whether to continue.
 4. **Hunt for it.**
    - With SOC-Hunter set up, it runs `/soc-hunter hunt`. The hypothesis covers the hunt list, activity since Oct 17, and three behaviors: PHP workers starting shells, `curl` or `wget`; new `.php` files under web roots; outbound connections from PHP workers.
    - Without SOC-Hunter, it writes the **hunt kit** (below).
@@ -64,6 +64,8 @@ The playbook only reads data. It never patches, scans, tags or changes anything 
    claude mcp add --transport http tenable https://cloud.tenable.com/mcp \
      --header "X-ApiKeys: accessKey=<ACCESS_KEY>;secretKey=<SECRET_KEY>"
    ```
+
+   In most shells, starting the command with a space keeps it, and your keys, out of shell history. Never paste the keys into a chat. If you do, revoke them and generate new ones.
 
 3. Restart Claude Code.
 
@@ -147,9 +149,10 @@ The searches look for the same three behaviors as the hunt hypothesis, since Oct
 ## Known limitations
 
 - **Status comes from the PHP version.** This is inherited from step 1. Distribution packages often backport fixes without changing the version number, so they can show as vulnerable when they're patched.
-- **Step 2's scope relies on the model.** `/fix-today` is general-purpose and has no built-in scope setting. The playbook asks it to rank only the fix-list hosts, then drops anything else and reports what it dropped and which hosts it left unranked.
+- **Step 2's scope relies on the model.** `/fix-today` is general-purpose and has no built-in scope setting. The playbook asks it to rank only the fix-list hosts for the PHP2Shell CVEs. It then drops any item for another host or other CVEs, and reports what it dropped and which hosts it left unranked. Trimming a bundled fix down to its PHP2Shell part is still up to the model.
 - **The hunt-kit searches need your field names.** Index names, data models, process names and web root paths vary. Check them against your data before you trust an empty result. The outbound-connection searches will show PHP applications that call outside APIs.
-- **Host names must match.** The searches match hosts by FQDN, or by asset name when Tenable has no FQDN. If your SIEM uses short names or IPs, `hunt-hosts.csv` has both name and IP.
+- **Host names must match.** The searches list each host under every name Tenable has for it (asset name, FQDN and short name). Splunk also matches IPs. If your SIEM or EDR names hosts differently, a filter that matches nothing returns nothing, which looks the same as "not hit". Run one search without the filter first to see the names your data uses.
+- **Time pickers.** In Sentinel and Kibana Discover, set the time picker to cover Oct 17 to now. The kit says so in each section.
 
 ## Repository layout
 

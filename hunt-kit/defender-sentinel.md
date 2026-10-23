@@ -4,13 +4,17 @@ Behavior-based. No PHP2Shell IOCs have been published; these searches look for w
 
 These run in Defender XDR advanced hunting, or in Sentinel when the Defender XDR connector streams the `Device*` tables. Check the field names against your data before you trust an empty result.
 
+The process filters match on names that start with `php`, so they catch versioned binaries such as Debian's `php-fpm8.2`.
+
+**Set the time picker.** These queries filter on `Timestamp`. Sentinel and Log Analytics only treat the time range as "set in query" when a query filters on `TimeGenerated`, so set the time picker to cover $start to now, or the picker's default (often the last 24 hours) silently narrows the hunt.
+
 ### 1. A PHP worker starts a shell, curl or wget
 
 ```kql
 DeviceProcessEvents
 | where Timestamp >= datetime($start)
-| where InitiatingProcessFileName has_any ("php-fpm", "php-cgi", "httpd", "apache2")
-    or InitiatingProcessFileName matches regex @"^php[0-9.]*$$"
+| where InitiatingProcessFileName startswith "php"
+    or InitiatingProcessFileName in~ ("httpd", "apache2")
 | where FileName in~ ("sh", "bash", "dash", "zsh", "curl", "wget")
 $kql_filter
 | project Timestamp, DeviceName, AccountName, InitiatingProcessFileName,
@@ -36,8 +40,8 @@ $kql_filter
 ```kql
 DeviceNetworkEvents
 | where Timestamp >= datetime($start)
-| where InitiatingProcessFileName has_any ("php-fpm", "php-cgi", "httpd", "apache2")
-    or InitiatingProcessFileName matches regex @"^php[0-9.]*$$"
+| where InitiatingProcessFileName startswith "php"
+    or InitiatingProcessFileName in~ ("httpd", "apache2")
 | where ActionType == "ConnectionSuccess" and RemoteIPType == "Public"
 $kql_filter
 | summarize Connections = count(), FirstSeen = min(Timestamp), LastSeen = max(Timestamp)

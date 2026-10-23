@@ -2,7 +2,7 @@
 
 Behavior-based. No PHP2Shell IOCs have been published; these searches look for what exploitation does, not for known indicators.
 
-The first two searches use the CIM Endpoint data model. The third uses Sysmon for Linux network events, because the CIM network data model does not carry the process name. Check the field names against your data before you trust an empty result.
+The first two searches use the CIM Endpoint data model. The third uses Sysmon for Linux network events, because the CIM network data model does not carry the process name; it searches `index=*`, so narrow it to the index that holds your Sysmon data. Each search sets `earliest`, which overrides the time picker. Check the field names against your data before you trust an empty result.
 
 ### 1. A PHP worker starts a shell, curl or wget
 
@@ -31,7 +31,7 @@ The first two searches use the CIM Endpoint data model. The third uses Sysmon fo
 ### 3. Outbound connections from PHP workers
 
 ```spl
-sourcetype="sysmon:linux" EventCode=3 Initiated="true"
+index=* sourcetype="sysmon:linux" EventCode=3 Initiated="true"
     Image IN ("*/php*", "*/httpd", "*/apache2")
     earliest="$start_spl" $net_filter
 | where NOT (cidrmatch("10.0.0.0/8", DestinationIp) OR cidrmatch("172.16.0.0/12", DestinationIp)

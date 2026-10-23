@@ -192,6 +192,7 @@ def find_markdown(h):
         f"## Hunt list ({len(h['hunt_list'])} hosts)", "",
         "Every host step 1 saw running PHP, patched or not. Hosts that patched after "
         f"{HUNT_START} are in scope for step 3.", "",
+        host_table(h["hunt_list"]) if h["hunt_list"] else "No PHP hosts reported.", "",
         "## Step 1 reports", "",
     ]
     parts += [f"- {k.upper()}: `{v}`" for k, v in h["reports"].items() if v]
@@ -206,29 +207,52 @@ def load_handoff(run_dir, name, step_cmd):
     path = Path(run_dir) / f"{name}.json"
     if not path.is_file():
         raise PlaybookError(f"{path} not found. Run `playbook.py {step_cmd} {run_dir}` first.")
-    return read_json(path)
+    data = read_json(path)
+    # The folder may have been moved or copied since the handoff was written
+    # (a SOC lead picking it up from a share), so trust where it is now.
+    data["run_dir"] = str(Path(run_dir))
+    return data
+
+
+def name_forms(host):
+    """Lower-cased names a host may go by: asset, FQDN and the FQDN's short form."""
+    names = {host.get("asset") or "", host.get("fqdn") or ""}
+    if host.get("fqdn"):
+        names.add(host["fqdn"].split(".")[0])
+    return {n.lower() for n in names if n}
+
+
+def match_host(item, hosts):
+    """The fix-list host an item refers to, or None. An IP narrows first; a name
+    (any case, asset, FQDN or short name) settles it. Ambiguous means no match."""
+    names = name_forms({"asset": item.get("asset"), "fqdn": item.get("asset")})
+    by_name = [h for h in hosts if names & name_forms(h)]
+    if item.get("ip"):
+        by_ip = [h for h in hosts if h["ip"] == item["ip"]]
+        if len(by_ip) > 1:
+            by_ip = [h for h in by_ip if h in by_name]
+        if len(by_ip) == 1:
+            return by_ip[0]
+    return by_name[0] if len(by_name) == 1 else None
 
 
 def build_fix_handoff(find, items):
     """Match /fix-today's ranked items to the fix list. Items for hosts outside
-    the fix list are reported, not kept; fix-list hosts it didn't rank are listed."""
-    by_key = {(h["asset"], h["ip"]): h for h in find["fix_list"]}
-    by_name = {}
-    for h in find["fix_list"]:
-        by_name.setdefault(h["asset"], []).append(h)
+    the fix list, or for CVEs other than PHP2Shell's, are reported, not kept;
+    fix-list hosts it didn't rank are listed."""
+    scope_cves = set(cves(find))
     kept, out_of_scope, ranked = [], [], set()
     for item in items:
         priority = str(item.get("priority", "")).upper()
         if priority not in PRIORITIES:
             raise PlaybookError(f"priority must be one of {', '.join(PRIORITIES)}, "
                                 f"got {item.get('priority')!r} for {item.get('asset')!r}")
+        if not isinstance(item.get("cves"), list) or not item["cves"]:
+            raise PlaybookError(f"item for {item.get('asset')!r} needs a 'cves' list: the CVEs "
+                                "/fix-today gave for that fix")
         item = dict(item, priority=priority)
-        host = by_key.get((item.get("asset", ""), item.get("ip", "")))
-        if host is None and not item.get("ip"):
-            # A blank IP matches by name only when the name is unambiguous.
-            matches = by_name.get(item.get("asset", ""), [])
-            host = matches[0] if len(matches) == 1 else None
-        if host is None:
+        host = match_host(item, find["fix_list"])
+        if host is None or not scope_cves & set(item["cves"]):
             out_of_scope.append(item)
             continue
         item["ip"] = host["ip"]
@@ -267,10 +291,12 @@ def fix_markdown(h):
                       f"- **Interim mitigation:** {i.get('mitigation') or '–'}",
                       f"- **Why:** {i.get('why') or '–'}", ""]
     parts += ["## Out of scope (dropped)", "",
-              "Items /fix-today ranked that are not on the PHP2Shell fix list. "
-              "They are not part of this response.", ""]
-    parts += ([f"- {i.get('priority')}: {i.get('asset')} ({i.get('ip') or 'no IP'}): "
-               f"{i.get('fix') or '–'}" for i in h["out_of_scope"]] or ["None."])
+              "Items /fix-today ranked for hosts not on the PHP2Shell fix list, or for "
+              "other CVEs. They are not part of this response. If a host here is one of "
+              "yours under another name, check it against the fix list.", ""]
+    parts += ([f"- {i.get('priority')}: {i.get('asset')} ({i.get('ip') or 'no IP'}), "
+               f"{', '.join(i.get('cves') or [])}: {i.get('fix') or '–'}"
+               for i in h["out_of_scope"]] or ["None."])
     parts += ["", "## Not ranked by /fix-today", "",
               "Hosts on the fix list that /fix-today did not rank. They still need a fix.", ""]
     parts += [host_table(h["not_ranked"]) if h["not_ranked"] else "None."]
@@ -279,8 +305,26 @@ def fix_markdown(h):
 
 
 def host_names(hosts):
-    return sorted({h.get("fqdn") or h.get("asset") for h in hosts
-                   if h.get("fqdn") or h.get("asset")})
+    """Every name a host may go by in a SIEM or EDR: asset name, FQDN and the
+    FQDN's short form, as Tenable spelled them."""
+    names = set()
+    for h in hosts:
+        for n in (h.get("asset"), h.get("fqdn")):
+            if n:
+                names.add(n)
+        if h.get("fqdn"):
+            names.add(h["fqdn"].split(".")[0])
+    return sorted(names)
+
+
+def host_ips(hosts):
+    return sorted({h["ip"] for h in hosts if h.get("ip")})
+
+
+def unnamed_ips(hosts):
+    """IPs of hosts Tenable gave no name for."""
+    return sorted({h["ip"] for h in hosts
+                   if h.get("ip") and not (h.get("asset") or h.get("fqdn"))})
 
 
 def quote_list(names, lang):
@@ -294,10 +338,10 @@ def quote_list(names, lang):
 def hunt_scope(find):
     """'inline' (hosts written into queries), 'lookup' (too many: use
     hunt-hosts.csv) or 'fleet' (no hosts known: hunt everything)."""
-    n = len(find["hunt_list"])
-    if n == 0:
+    hosts = find["hunt_list"]
+    if not (host_names(hosts) or host_ips(hosts)):
         return "fleet"
-    return "inline" if n <= INLINE_HOST_LIMIT else "lookup"
+    return "inline" if len(hosts) <= INLINE_HOST_LIMIT else "lookup"
 
 
 def hunt_hosts_path(find):
@@ -321,7 +365,8 @@ def cves(find):
 def hunt_hypothesis(find):
     scope = hunt_scope(find)
     if scope == "inline":
-        where = "on these hosts: " + ", ".join(host_names(find["hunt_list"]))
+        targets = host_names(find["hunt_list"]) + unnamed_ips(find["hunt_list"])
+        where = "on these hosts: " + ", ".join(targets)
     elif scope == "lookup":
         where = (f"fleet-wide: all PHP web servers. The {len(find['hunt_list'])} hosts "
                  f"Tenable saw running PHP are listed in {hunt_hosts_path(find)}; start with those")
@@ -338,24 +383,28 @@ def hunt_hypothesis(find):
 def kit_values(find):
     scope = hunt_scope(find)
     names = host_names(find["hunt_list"])
+    # Splunk's dest and host fields hold a name or an IP, so it gets both.
+    spl_targets = names + host_ips(find["hunt_list"])
     y, m, d = HUNT_START.split("-")
     values = {"start": HUNT_START, "start_spl": f"{m}/{d}/{y}:00:00:00", "start_us": f"{m}/{d}/{y}"}
     spl_fields = {"proc_filter": "Processes.dest", "file_filter": "Filesystem.dest", "net_filter": "host"}
     for key, field in spl_fields.items():
         if scope == "inline":
-            values[key] = f"{field} IN ({quote_list(names, 'spl')})"
+            values[key] = f"{field} IN ({quote_list(spl_targets, 'spl')})"
         elif scope == "lookup":
             values[key] = f"[| inputlookup hunt-hosts.csv | rename host AS {field} | fields {field}]"
         else:
             values[key] = ""
-    if scope == "inline":
+    # A comment, not an empty line: a blank line ends a KQL query in Log Analytics.
+    fleet = "// no host filter: runs fleet-wide"
+    if scope == "inline" and names:
         values["kql_filter"] = f"| where DeviceName in~ ({quote_list(names, 'kql')})"
         values["esql_filter"] = f"AND host.name IN ({quote_list(names, 'esql')})"
     elif scope == "lookup":
         values["kql_filter"] = '| where DeviceName in~ ((_GetWatchlist("php2shell-hunt-hosts") | project SearchKey))'
-        values["esql_filter"] = ""
+        values["esql_filter"] = fleet
     else:
-        values["kql_filter"] = values["esql_filter"] = ""
+        values["kql_filter"] = values["esql_filter"] = fleet
     return values
 
 
@@ -364,7 +413,9 @@ def render_hunt_kit(find, kit_dir=KIT_DIR):
     n = len(find["hunt_list"])
     if scope == "inline":
         scope_text = (f"The searches are limited to the {n} hosts Tenable saw running PHP "
-                      "(patched or not); the same hosts are in `hunt-hosts.csv`.")
+                      "(patched or not); the same hosts are in `hunt-hosts.csv`. Each host is "
+                      "listed under every name Tenable has for it (asset name, FQDN and short "
+                      "name), and Splunk also matches IPs.")
     elif scope == "lookup":
         scope_text = (
             f"Tenable saw {n} hosts running PHP, too many to write into each search. "
@@ -383,6 +434,10 @@ def render_hunt_kit(find, kit_dir=KIT_DIR):
         "Behavior-based: no PHP2Shell IOCs have been published, so these searches look for "
         "what exploitation does, not for known indicators.", "",
         "## Scope", "", scope_text, "",
+        "**Check how your tools name hosts.** A SIEM or EDR may record short names, FQDNs, "
+        "IPs or a different case than Tenable does. If a host filter matches nothing, the "
+        "search returns nothing, which looks the same as \"not hit\". Run one search without "
+        "the filter first to see the names your data uses.", "",
         "Every search can also be run fleet-wide by removing its host filter, which catches "
         "PHP servers Tenable never scanned.", "",
         "Contents: Splunk, Microsoft Defender XDR and Sentinel (KQL), Elastic (ES|QL), "

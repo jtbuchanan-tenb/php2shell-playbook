@@ -2,7 +2,9 @@
 
 Behavior-based. No PHP2Shell IOCs have been published; these searches look for what exploitation does, not for known indicators.
 
-These use Elastic Defend endpoint events with ECS field names. Check the index patterns and field names against your data before you trust an empty result.
+These use Elastic Defend endpoint events with ECS field names. Check the index patterns and field names against your data before you trust an empty result. `IN` matches host names exactly, case included.
+
+**Set the time picker.** In Kibana Discover, the global time picker applies on top of the `WHERE` clause. Set it to cover $start to now, or its default (often the last 15 minutes) silently narrows the hunt.
 
 ### 1. A PHP worker starts a shell, curl or wget
 

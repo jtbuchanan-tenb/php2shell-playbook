@@ -21,7 +21,7 @@ Source of truth for CVEs, fixed releases and mitigations: the [Tenable Research 
 
 - **Read only.** Never patch, scan, tag, open tickets or change anything in Tenable, a SIEM, an EDR or a host. The three skills only read data, and so does this one.
 - **Nothing invented.** Every host, version, fix and finding comes from a tool result in this run. No PHP2Shell IOCs have been published; never make up IP addresses, domains or hashes.
-- **No keys in the chat.** Never ask for, accept or repeat Tenable API keys. Setup commands that carry keys are run by the person in a separate terminal.
+- **No keys in the chat.** Never ask for, accept or repeat Tenable API keys. Setup commands that carry keys are run by the person in a separate terminal. If someone pastes keys into the chat anyway, don't use or repeat them; tell them the keys are now in this conversation's history and to revoke them and generate new ones in Tenable (Settings > My Account > API Keys).
 
 ## Arguments
 
@@ -46,6 +46,8 @@ Do all three checks before the first step that runs.
         claude mcp add --transport http tenable https://cloud.tenable.com/mcp \
           --header "X-ApiKeys: accessKey=<ACCESS_KEY>;secretKey=<SECRET_KEY>"
         ```
+
+        In most shells, starting the command with a space keeps it, and the keys, out of shell history.
 
      4. **Restart Claude Code**, then run `/php2shell-playbook` again.
      5. **Docs:** https://docs.tenable.com/vulnerability-management/Content/getting-started/hexa-AI-MCP.htm
@@ -99,15 +101,17 @@ Do all three checks before the first step that runs.
 
    > Scope this run to PHP2Shell only. Rank only these hosts: <asset (IP) for each fix-list host>. Only the findings for <CVEs from faq.json> matter. Ignore other assets and other vulnerabilities. If the dashboard widget isn't available, the FIRST / NEXT / SOON text summary is enough.
 
-   `/fix-today` is general-purpose and may still rank other assets. Keep only what it says about the fix-list hosts.
+   `/fix-today` is general-purpose: it ranks by exposure across all findings and often merges several CVEs into one action per host ("one reboot closes …"). Keep only what it says about the fix-list hosts, and of each fix keep only the PHP2Shell part.
 4. Write `<run>/fix-items.json`, transcribing its FIRST / NEXT / SOON result exactly. Use one object per host:
 
    ```json
-   [{"priority": "FIRST", "asset": "…", "ip": "…", "fix": "…", "mitigation": "…", "why": "…"}]
+   [{"priority": "FIRST", "asset": "…", "ip": "…", "cves": ["CVE-…"], "fix": "…", "mitigation": "…", "why": "…"}]
    ```
 
-   `fix` is Tenable's remediation as `/fix-today` gave it. Don't write fixes of your own.
-5. Run `playbook.py fix <run> <run>/fix-items.json`. It writes `handoff-2-fix.md` and `handoff-2-fix.json`. It drops anything outside the fix list (listed under "Out of scope") and lists fix-list hosts `/fix-today` didn't rank.
+   - `cves` is the list of CVEs `/fix-today` gave for that action. It is required.
+   - `fix` is Tenable's remediation as `/fix-today` gave it, cut down to only the PHP2Shell part when it bundled other fixes. Don't write fixes of your own.
+   - `asset` and `ip` are as `/fix-today` named the host. The helper matches either one against the fix list, in any case.
+5. Run `playbook.py fix <run> <run>/fix-items.json`. It writes `handoff-2-fix.md` and `handoff-2-fix.json`. It drops anything for a host outside the fix list, or with none of the PHP2Shell CVEs (listed under "Out of scope"), and lists fix-list hosts `/fix-today` didn't rank.
 6. Tell the person the FIRST / NEXT / SOON counts, and anything out of scope or not ranked, and show the path to `handoff-2-fix.md`.
 7. Ask: **"Continue to Hunt for it?"** If not: `/php2shell-playbook hunt <run>`.
 
