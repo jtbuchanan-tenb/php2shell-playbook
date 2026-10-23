@@ -273,5 +273,95 @@ class HuntTest(RunDirTest):
         self.assertTrue((self.run / "handoff-3-hunt.md").exists())
 
 
+class PreflightTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def touch(self, rel):
+        p = self.home / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("x")
+
+    def test_nothing_installed(self):
+        self.assertEqual(playbook.preflight(self.home), {
+            "php2shell_tenable": False, "fix_today": False,
+            "soc_hunter": False, "soc_hunter_configured": False})
+
+    def test_all_installed_and_configured(self):
+        for rel in [".claude/skills/php2shell-tenable/SKILL.md", ".claude/commands/fix-today.md",
+                    ".claude/skills/soc-hunter/SKILL.md", ".claude/skills/soc-hunter/CONFIG.local.md"]:
+            self.touch(rel)
+        self.assertTrue(all(playbook.preflight(self.home).values()))
+
+    def test_soc_hunter_installed_not_configured(self):
+        self.touch(".claude/skills/soc-hunter/SKILL.md")
+        r = playbook.preflight(self.home)
+        self.assertTrue(r["soc_hunter"])
+        self.assertFalse(r["soc_hunter_configured"])
+
+    def test_cli_preflight_prints_json(self):
+        code, out, _ = run_cli(["preflight", "--home", str(self.home)])
+        self.assertEqual(code, 0)
+        self.assertFalse(json.loads(out)["fix_today"])
+
+
+class LatestRunTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_picks_newest_folder_with_report(self):
+        for name in ["2026-10-22-0900", "2026-10-23-1100"]:
+            (self.root / name).mkdir()
+            (self.root / name / "report.csv").write_text("x")
+        (self.root / "2026-10-23-1200").mkdir()          # newer but empty
+        self.assertEqual(playbook.latest_run(self.root), self.root / "2026-10-23-1100")
+
+    def test_none_when_empty_or_missing(self):
+        self.assertIsNone(playbook.latest_run(self.root))
+        self.assertIsNone(playbook.latest_run(self.root / "nope"))
+
+    def test_cli_latest_run_exit_codes(self):
+        self.assertEqual(run_cli(["latest-run", "--root", str(self.root)])[0], 1)
+        (self.root / "2026-10-23-1100").mkdir()
+        (self.root / "2026-10-23-1100" / "report.csv").write_text("x")
+        code, out, _ = run_cli(["latest-run", "--root", str(self.root)])
+        self.assertEqual((code, out.strip()), (0, str(self.root / "2026-10-23-1100")))
+
+
+class SummaryTest(RunDirTest):
+    def test_summary_after_find_only(self):
+        run_cli(["find", str(self.run)])
+        md = playbook.write_summary(self.run).read_text(encoding="utf-8")
+        self.assertIn("report.csv", md)
+        self.assertIn("handoff-1-find.md", md)
+        self.assertIn("Fix it: not run", md)
+        self.assertIn("Hunt for it: not run", md)
+
+    def test_summary_after_all_three(self):
+        run_cli(["find", str(self.run)])
+        run_cli(["fix", str(self.run), str(ITEMS)])
+        run_cli(["hunt-kit", str(self.run)])
+        result = self.run / "hunt-result.json"
+        result.write_text('{"mode": "hunt-kit"}')
+        run_cli(["hunt", str(self.run), str(result)])
+        md = playbook.write_summary(self.run).read_text(encoding="utf-8")
+        for s in ["handoff-1-find.md", "handoff-2-fix.md", "handoff-3-hunt.md",
+                  "hunt-kit.md", "hunt-hosts.csv", "](report.csv)"]:
+            self.assertIn(s, md)
+        self.assertNotIn(str(self.run), md.split("Run folder")[1].split("\n", 1)[1])
+        self.assertNotIn(": not run.", md)
+
+    def test_summary_without_handoff_1_fails(self):
+        self.assertNotEqual(run_cli(["summary", str(self.run)])[0], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

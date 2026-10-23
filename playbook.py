@@ -10,6 +10,9 @@ file (Markdown and JSON) after each step. Standard library only.
     python3 playbook.py hypothesis RUN_DIR
     python3 playbook.py hunt-kit RUN_DIR
     python3 playbook.py hunt RUN_DIR RESULT_JSON
+    python3 playbook.py summary RUN_DIR
+    python3 playbook.py preflight [--home DIR]
+    python3 playbook.py latest-run [--root DIR]
 """
 import argparse
 import csv
@@ -41,6 +44,7 @@ PRIORITIES = ["FIRST", "NEXT", "SOON"]
 INLINE_HOST_LIMIT = 200
 KIT_DIR = Path(__file__).resolve().parent / "hunt-kit"
 KIT_FILES = ["splunk.md", "defender-sentinel.md", "elastic.md", "checklist.md"]
+REPORTS_ROOT = Path.home() / "Dev" / "php2shell-reports"
 DEFAULT_CVES = ["CVE-2026-109618", "CVE-2026-109619"]
 
 HOST_FIELDS = ["asset", "ip", "fqdn", "source", "php_version", "status",
@@ -442,6 +446,79 @@ def hunt_markdown(h):
     return "\n".join(parts)
 
 
+def preflight(home):
+    """Which of the three skills are installed under HOME/.claude, and whether
+    SOC-Hunter has its local config."""
+    claude = Path(home) / ".claude"
+    soc = claude / "skills" / "soc-hunter"
+    return {
+        "php2shell_tenable": (claude / "skills" / "php2shell-tenable" / "SKILL.md").is_file(),
+        "fix_today": (claude / "commands" / "fix-today.md").is_file(),
+        "soc_hunter": (soc / "SKILL.md").is_file(),
+        "soc_hunter_configured": (soc / "CONFIG.local.md").is_file(),
+    }
+
+
+def latest_run(root):
+    """Newest run folder that has a report.csv. Folder names are
+    YYYY-MM-DD-HHMM, so name order is time order."""
+    root = Path(root)
+    if not root.is_dir():
+        return None
+    runs = sorted(p for p in root.iterdir() if (p / "report.csv").is_file())
+    return runs[-1] if runs else None
+
+
+def write_summary(run_dir):
+    run_dir = Path(run_dir)
+    find = load_handoff(run_dir, "handoff-1-find", "find")
+
+    def link(name):
+        return f"[{name}]({name})" if (run_dir / name).is_file() else None
+
+    counts = ", ".join(f"{find['status_counts'][k]} {k}"
+                       for k in sorted(find["status_counts"], key=rank))
+    parts = [
+        "# PHP2Shell playbook: summary", "",
+        f"Run folder: `{run_dir}`", "",
+        "## Find it", "",
+        f"{len(find['hunt_list'])} hosts running PHP: {counts}. "
+        f"{len(find['fix_list'])} need a fix.", "",
+    ]
+    parts += [f"- {x}" for x in (link("handoff-1-find.md"), link("report.html"), link("report.pdf"),
+                                 link("report.csv"), link("findings.json")) if x]
+    fix_path = run_dir / "handoff-2-fix.json"
+    parts += ["", "## Fix it", ""]
+    if fix_path.is_file():
+        fix = read_json(fix_path)
+        by_p = ", ".join(f"{sum(1 for i in fix['items'] if i['priority'] == p)} {p}" for p in PRIORITIES)
+        parts += [f"/fix-today ranked {len(fix['items'])} of {fix['fix_list_size']} hosts: {by_p}. "
+                  f"{len(fix['not_ranked'])} not ranked, {len(fix['out_of_scope'])} out of scope.", "",
+                  f"- {link('handoff-2-fix.md')}"]
+    else:
+        parts += ["Fix it: not run."]
+    hunt_path = run_dir / "handoff-3-hunt.json"
+    parts += ["", "## Hunt for it", ""]
+    if hunt_path.is_file():
+        hunt = read_json(hunt_path)
+        if hunt["mode"] == "soc-hunter":
+            parts += [f"SOC-Hunter hunted {hunt['hunt_list_size']} hosts since {hunt['start_date']}. "
+                      f"Verdict: {hunt.get('verdict') or 'not recorded'}. "
+                      f"Hunt file: `{hunt.get('hunt_file') or 'not recorded'}`.", ""]
+        else:
+            parts += [f"SOC-Hunter was not run; the hunt kit covers {hunt['hunt_list_size']} hosts "
+                      f"since {hunt['start_date']}.", ""]
+        parts += [f"- {x}" for x in (link("handoff-3-hunt.md"), link("hunt-kit.md"),
+                                     link("hunt-hosts.csv")) if x]
+    else:
+        parts += ["Hunt for it: not run."]
+        if (run_dir / "hunt-kit.md").is_file():
+            parts += ["", f"- {link('hunt-kit.md')}"]
+    path = run_dir / "summary.md"
+    path.write_text("\n".join(parts) + "\n", encoding="utf-8")
+    return path
+
+
 def write_handoff(run_dir, name, data, markdown):
     run_dir = Path(run_dir)
     jpath, mpath = run_dir / f"{name}.json", run_dir / f"{name}.md"
@@ -493,6 +570,21 @@ def cmd_hunt(args):
         print(p)
 
 
+def cmd_summary(args):
+    print(write_summary(args.run_dir))
+
+
+def cmd_preflight(args):
+    print(json.dumps(preflight(args.home), indent=2))
+
+
+def cmd_latest_run(args):
+    run = latest_run(args.root)
+    if run is None:
+        raise PlaybookError(f"no run folder with a report.csv under {args.root}")
+    print(run)
+
+
 def parser():
     p = argparse.ArgumentParser(prog="playbook.py", description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="command", required=True)
@@ -513,6 +605,15 @@ def parser():
     s.add_argument("run_dir")
     s.add_argument("result_json")
     s.set_defaults(func=cmd_hunt)
+    s = sub.add_parser("summary", help="write summary.md from the handoffs so far")
+    s.add_argument("run_dir")
+    s.set_defaults(func=cmd_summary)
+    s = sub.add_parser("preflight", help="report which of the three skills are installed")
+    s.add_argument("--home", default=str(Path.home()))
+    s.set_defaults(func=cmd_preflight)
+    s = sub.add_parser("latest-run", help="print the newest step 1 run folder")
+    s.add_argument("--root", default=str(REPORTS_ROOT))
+    s.set_defaults(func=cmd_latest_run)
     return p
 
 
